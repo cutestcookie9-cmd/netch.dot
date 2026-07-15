@@ -63,6 +63,17 @@ def parse_block(lines, i, base_indent):
             statements.append({"type": "while", "condition": condition, "body": body})
             continue
 
+        foreach_match = re.match(r'^for each\s+(\w+)\s+in\s+(\w+)\s*:$', stripped)
+        if foreach_match:
+            item_name, list_name = foreach_match.groups()
+            child_indent = peek_next_indent(lines, i + 1)
+            if child_indent is None or child_indent <= indent:
+                body, i = [], i + 1
+            else:
+                body, i = parse_block(lines, i + 1, child_indent)
+            statements.append({"type": "foreach", "item_name": item_name, "list_name": list_name, "body": body})
+            continue
+
         repeat_match = re.match(r'^repeat\s+(.+)\s+times:$', stripped)
         if repeat_match:
             count_expr = repeat_match.group(1).strip()
@@ -111,7 +122,7 @@ def collect_functions(statements, out):
         elif s["type"] == "if":
             collect_functions(s["body"], out)
             collect_functions(s["else_body"], out)
-        elif s["type"] in ("while", "repeat"):
+        elif s["type"] in ("while", "repeat", "foreach"):
             collect_functions(s["body"], out)
 
 
@@ -123,7 +134,7 @@ def run_netch(filepath):
         print("[netch warning] missing <using.netch> at top of file, running anyway...\n")
 
     window_mode = len(raw_lines) > 1 and raw_lines[1].strip() == '<window.using>'
-    window_state = {"root": None, "widgets": [], "buttons": {}, "selections": {}}
+    window_state = {"root": None, "widgets": [], "buttons": {}, "selections": {}, "textboxes": {}}
     bot_state = {"token": None, "onmessage_func": None, "prefix": "!", "commands": {}}
 
     variables = {}
@@ -155,14 +166,65 @@ def run_netch(filepath):
         except Exception:
             return None
 
-    # ---- helper: resolve a single value (string literal, number, variable, or selection.name) ----
+    # ---- helper: split a comma-separated list literal's inside text, respecting quotes and brackets ----
+    def split_list_items(inner):
+        items = []
+        current = ""
+        depth = 0
+        in_quotes = False
+        for ch in inner:
+            if ch == '"':
+                in_quotes = not in_quotes
+                current += ch
+            elif ch == '[' and not in_quotes:
+                depth += 1
+                current += ch
+            elif ch == ']' and not in_quotes:
+                depth -= 1
+                current += ch
+            elif ch == ',' and depth == 0 and not in_quotes:
+                items.append(current.strip())
+                current = ""
+            else:
+                current += ch
+        if current.strip():
+            items.append(current.strip())
+        return items
+
+    # ---- helper: parse a netch list literal like [1, 2, apple, "banana split"] into a real python list ----
+    def parse_list_literal(text, scope):
+        text = text.strip()
+        if not (text.startswith('[') and text.endswith(']')):
+            return None
+        inner = text[1:-1].strip()
+        if inner == "":
+            return []
+        return [resolve_value(item, scope) for item in split_list_items(inner)]
+
+    # ---- helper: resolve a single value (string literal, number, variable, list literal, index, or selection.name) ----
     def resolve_value(token, scope):
         token = token.strip()
         if token.startswith('"') and token.endswith('"'):
             return token[1:-1]
+        if token.startswith('[') and token.endswith(']'):
+            result = parse_list_literal(token, scope)
+            if result is not None:
+                return result
         sel_match = re.match(r'^selection\.(\w+)$', token)
         if sel_match and sel_match.group(1) in window_state["selections"]:
             return window_state["selections"][sel_match.group(1)]["var"].get()
+        if token in window_state["textboxes"]:
+            return window_state["textboxes"][token].get("1.0", "end-1c")
+        index_match = re.match(r'^(\w+)\[(.+)\]$', token)
+        if index_match:
+            list_name, index_expr = index_match.groups()
+            if list_name in scope and isinstance(scope[list_name], list):
+                try:
+                    idx = int(resolve_value(index_expr, scope))
+                    return scope[list_name][idx]
+                except (ValueError, TypeError, IndexError):
+                    print(f"[netch error] '{token}' — that index isn't valid for '{list_name}'")
+                    return None
         if token in scope:
             return scope[token]
         try:
@@ -271,6 +333,12 @@ def run_netch(filepath):
                 execute(functions[bot_state["onmessage_func"]]["body"], call_scope)
 
         client.run(bot_state["token"])
+
+    # ---- helper: print a list nicely (comma separated, no python-style brackets/quotes) instead of raw repr ----
+    def format_for_print(value):
+        if isinstance(value, list):
+            return ", ".join(format_for_print(v) for v in value)
+        return value
 
     # ---- helper: run a single action command (used by open/delete/copy/close/send AND buttons AND bot commands) ----
     def run_action(action_text, scope=None):
@@ -396,9 +464,60 @@ def run_netch(filepath):
                         return False
                 continue
 
+            if stmt["type"] == "foreach":
+                list_name = stmt["list_name"]
+                if list_name not in scope or not isinstance(scope[list_name], list):
+                    print(f"[netch error] '{list_name}' isn't a list, so 'for each' can't loop over it")
+                    continue
+                for item in list(scope[list_name]):  # loop over a snapshot so edits mid-loop are safe
+                    scope[stmt["item_name"]] = item
+                    if window_mode and window_state["root"]:
+                        window_state["root"].update()
+                    result = execute(stmt["body"], scope)
+                    if result is False:
+                        return False
+                continue
+
             stripped = stmt["text"]
 
             if not stripped or stripped == '<using.netch>' or stripped == '<window.using>' or stripped.startswith('#'):
+                continue
+
+            write_match = re.match(r'^write\((.+?),\s*(.+)\)$', stripped)
+            if write_match:
+                source_expr, path_expr = write_match.groups()
+                source_expr, path_expr = source_expr.strip(), path_expr.strip()
+                if source_expr in window_state["textboxes"]:
+                    text_to_write = window_state["textboxes"][source_expr].get("1.0", "end-1c")
+                else:
+                    text_to_write = resolve_value(source_expr, scope)
+                path = resolve_value(path_expr, scope)
+                path = path[1:-1] if isinstance(path, str) and path.startswith('"') and path.endswith('"') else path
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("" if text_to_write is None else str(text_to_write))
+                    print(f"[netch] saved to {path}")
+                except Exception as e:
+                    print(f"[netch error] couldn't write to '{path}': {e}")
+                continue
+
+            read_match = re.match(r'^read\((.+?),\s*(\w+)\)$', stripped)
+            if read_match:
+                path_expr, target = read_match.groups()
+                path = resolve_value(path_expr.strip(), scope)
+                path = path[1:-1] if isinstance(path, str) and path.startswith('"') and path.endswith('"') else path
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        file_text = f.read()
+                    if target in window_state["textboxes"]:
+                        box = window_state["textboxes"][target]
+                        box.delete("1.0", "end")
+                        box.insert("1.0", file_text)
+                    else:
+                        scope[target] = file_text
+                    print(f"[netch] loaded {path}")
+                except Exception as e:
+                    print(f"[netch error] couldn't read '{path}': {e}")
                 continue
 
             wait_match = re.match(r'^wait\((.+)\)$', stripped)
@@ -449,6 +568,21 @@ def run_netch(filepath):
                 root = get_window(window_state)
                 label = tk.Label(root, text=text, font=("Segoe UI", 20), bg="#f4f5f7", fg="#2d2d2d")
                 label.pack(pady=12, padx=20)
+                root.update()
+                continue
+
+            wtextbox_match = re.match(r'^window\.textbox\.(\w+)$', stripped)
+            if wtextbox_match:
+                if not window_mode:
+                    print("[netch error] window.textbox only works in a window app (add <window.using> under <using.netch>)")
+                    continue
+                box_name = wtextbox_match.group(1)
+                root = get_window(window_state)
+                box = tk.Text(root, height=1, width=10, font=("Segoe UI", 13), wrap="word", relief="flat",
+                              bg="white", fg="#2d2d2d", insertbackground="#2d2d2d",
+                              padx=10, pady=10, undo=True)
+                box.pack(fill="both", expand=True, padx=12, pady=8)
+                window_state["textboxes"][box_name] = box
                 root.update()
                 continue
 
@@ -633,29 +767,76 @@ def run_netch(filepath):
             if print_match:
                 content = print_match.group(1).strip()
                 sel_read_match = re.match(r'^selection\.(\w+)$', content)
+                length_match = re.match(r'^(\w+)\.length$', content)
                 math_result = try_math(content, scope)
                 if content.startswith('"') and content.endswith('"'):
                     print(content[1:-1])
+                elif content.startswith('[') and content.endswith(']') and parse_list_literal(content, scope) is not None:
+                    print(format_for_print(parse_list_literal(content, scope)))
                 elif sel_read_match and sel_read_match.group(1) in window_state["selections"]:
                     print(window_state["selections"][sel_read_match.group(1)]["var"].get())
+                elif length_match and length_match.group(1) in scope and isinstance(scope[length_match.group(1)], (list, str)):
+                    print(len(scope[length_match.group(1)]))
+                elif content in window_state["textboxes"]:
+                    print(window_state["textboxes"][content].get("1.0", "end-1c"))
+                elif re.match(r'^\w+\[.+\]$', content):
+                    print(format_for_print(resolve_value(content, scope)))
                 elif content in scope:
-                    print(scope[content])
+                    print(format_for_print(scope[content]))
                 elif math_result is not None:
                     print(math_result)
                 else:
                     print(f"[netch error] '{content}' is not defined")
                 continue
 
+            listadd_match = re.match(r'^(\w+)\.add\((.+)\)$', stripped)
+            if listadd_match:
+                list_name, item_expr = listadd_match.groups()
+                if list_name not in scope or not isinstance(scope[list_name], list):
+                    print(f"[netch error] '{list_name}' isn't a list, so you can't .add() to it")
+                    continue
+                scope[list_name].append(resolve_value(item_expr, scope))
+                continue
+
+            listremove_match = re.match(r'^(\w+)\.remove\((.+)\)$', stripped)
+            if listremove_match:
+                list_name, item_expr = listremove_match.groups()
+                if list_name not in scope or not isinstance(scope[list_name], list):
+                    print(f"[netch error] '{list_name}' isn't a list, so you can't .remove() from it")
+                    continue
+                value_to_remove = resolve_value(item_expr, scope)
+                if value_to_remove in scope[list_name]:
+                    scope[list_name].remove(value_to_remove)
+                else:
+                    print(f"[netch warning] '{value_to_remove}' wasn't in '{list_name}', nothing removed")
+                continue
+
             assign_match = re.match(r'^(\w+)\s*=\s*(.+)$', stripped)
             if assign_match:
                 var_name, raw_value = assign_match.groups()
                 raw_value = raw_value.strip()
+                if var_name in window_state["textboxes"]:
+                    new_text = resolve_value(raw_value, scope)
+                    if isinstance(new_text, str) and new_text.startswith('"') and new_text.endswith('"'):
+                        new_text = new_text[1:-1]
+                    box = window_state["textboxes"][var_name]
+                    box.delete("1.0", "end")
+                    box.insert("1.0", str(new_text) if new_text is not None else "")
+                    continue
                 math_result = try_math(raw_value, scope)
                 sel_read_match = re.match(r'^selection\.(\w+)$', raw_value)
+                list_literal = parse_list_literal(raw_value, scope) if raw_value.startswith('[') and raw_value.endswith(']') else None
+                index_match = re.match(r'^(\w+)\[(.+)\]$', raw_value)
                 if raw_value.startswith('"') and raw_value.endswith('"'):
                     scope[var_name] = raw_value[1:-1]
+                elif list_literal is not None:
+                    scope[var_name] = list_literal
+                elif index_match and index_match.group(1) in scope and isinstance(scope[index_match.group(1)], list):
+                    scope[var_name] = resolve_value(raw_value, scope)
                 elif sel_read_match and sel_read_match.group(1) in window_state["selections"]:
                     scope[var_name] = window_state["selections"][sel_read_match.group(1)]["var"].get()
+                elif raw_value in window_state["textboxes"]:
+                    scope[var_name] = window_state["textboxes"][raw_value].get("1.0", "end-1c")
                 elif raw_value in scope:
                     scope[var_name] = scope[raw_value]
                 elif raw_value.lstrip('-').isdigit():
