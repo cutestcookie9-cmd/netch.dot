@@ -14,7 +14,7 @@ We built netch to be readable by anyone, forgiving of mistakes, and powerful eno
 - **No steep learning curve.** If you can read English, you can read netch. `function`, `run()`, `print()` — it reads like plain instructions, not cryptic symbols.
 - **Forgiving, not fragile.** Made a typo or an indentation mistake? netch warns you and asks how you'd like to proceed instead of crashing outright.
 - **Room to grow.** Start with a simple script today, build a desktop app or a Discord bot tomorrow. netch doesn't box you in.
-- **Batteries included.** Windows, buttons, dropdowns, file operations, bots, and AI integration are all built into the language itself — no fighting with external frameworks to get something real running.
+- **Batteries included.** Windows, buttons, text editors, dropdowns, file operations, bots, and AI integration are all built into the language itself — no fighting with external frameworks to get something real running.
 
 ## Getting Started
 
@@ -58,6 +58,22 @@ repeat 3 times:
     print("netch is fun")
 \`\`\`
 
+### Lists
+
+\`\`\`netch
+fruits = [apple, banana, cherry]
+
+for each fruit in fruits:
+    print(fruit)
+
+fruits.add(mango)
+fruits.remove(banana)
+
+print(fruits)          # apple, cherry, mango
+print(fruits.length)   # 3
+print(fruits[0])       # apple
+\`\`\`
+
 ## Building Apps
 
 netch isn't limited to the console. Add a second header line to unlock a full desktop app mode:
@@ -74,6 +90,23 @@ window.button.click_me = action greet
 \`\`\`
 
 From here, you can add dropdowns, radio buttons, text inputs, and more — all with the same plain, readable syntax.
+
+### Text Editors (build a notepad in minutes)
+
+\`\`\`netch
+<using.netch>
+<window.using>
+
+window.title("My Notepad")
+window.size(600, 400)
+
+window.textbox.editor
+
+window.button.save = action write(editor, "notes.txt")
+window.button.open = action read("notes.txt", editor)
+\`\`\`
+
+That's a fully working notepad app — type, save to a file, and load it back later.
 
 ## Installation
 
@@ -98,14 +131,12 @@ netch is under active development. Planned additions include:
 - Expanded AI integration
 - Self-healing code — where small errors can be automatically caught and corrected without stopping your program
 - A broader standard library for apps and automation
+- A standalone .exe so Python isn't required to run netch
 
 ## Contributing
 
 netch is early, and there's a lot of ground still to cover. Issues, feedback, and pull requests are welcome — whether that's a bug report, a feature idea, or a fix.
 
-## License
-
-See the [LICENSE](LICENSE) file for details.
 
 ---
 
